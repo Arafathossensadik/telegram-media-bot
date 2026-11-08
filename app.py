@@ -5,7 +5,8 @@ from telegram.ext import Application, MessageHandler, ContextTypes, filters
 
 TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
 
-db = sqlite3.connect("media.db", check_same_thread=False)
+DB_PATH = "/data/media.db" if os.path.isdir("/data") else "media.db"
+db = sqlite3.connect(DB_PATH, check_same_thread=False)
 db.execute(
     "CREATE TABLE IF NOT EXISTS media (code TEXT PRIMARY KEY, file_id TEXT, kind TEXT)"
 )
@@ -13,7 +14,7 @@ db.commit()
 
 
 async def save_media(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Runs in groups: saves photo/video using the caption as the code."""
+    """Saves a photo/video using its caption as the code."""
     msg = update.effective_message
     if not msg or not msg.caption:
         return
@@ -36,7 +37,7 @@ async def save_media(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def send_media(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Runs in private chat: you send a code, bot sends the media."""
+    """In private chat: you send a code, the bot sends the media."""
     code = update.message.text.strip().lower()
     row = db.execute(
         "SELECT file_id, kind FROM media WHERE code = ?", (code,)
@@ -54,12 +55,11 @@ async def send_media(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 def main():
+    if not TOKEN:
+        raise SystemExit("Missing TELEGRAM_BOT_TOKEN")
+
     app = Application.builder().token(TOKEN).build()
-    app.add_handler(
-        MessageHandler(
-            filters.ChatType.GROUPS & (filters.PHOTO | filters.VIDEO), save_media
-        )
-    )
+    app.add_handler(MessageHandler(filters.PHOTO | filters.VIDEO, save_media))
     app.add_handler(
         MessageHandler(
             filters.ChatType.PRIVATE & filters.TEXT & ~filters.COMMAND, send_media
@@ -69,5 +69,5 @@ def main():
     app.run_polling()
 
 
-if __name__ == "__main__":
+if _name_ == "_main_":
     main()
