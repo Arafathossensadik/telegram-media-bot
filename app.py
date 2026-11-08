@@ -15,6 +15,13 @@ from telegram.ext import (
 TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
 BATCH_IDLE_SECONDS = 300  # batch closes after 5 minutes without media
 
+# Optional: extra admin user IDs, e.g. ADMIN_IDS=12345,67890
+ADMIN_IDS = {
+    int(x.strip())
+    for x in os.environ.get("ADMIN_IDS", "").split(",")
+    if x.strip().isdigit()
+}
+
 DB_PATH = "/data/media.db" if os.path.isdir("/data") else "media.db"
 db = sqlite3.connect(DB_PATH, check_same_thread=False)
 db.execute(
@@ -31,6 +38,7 @@ db.execute(
     "id INTEGER PRIMARY KEY AUTOINCREMENT, "
     "group_id TEXT, file_id TEXT, unique_id TEXT, kind TEXT)"
 )
+db.execute("CREATE TABLE IF NOT EXISTS known_groups (chat_id INTEGER PRIMARY KEY)")
 try:
     db.execute(
         "INSERT OR IGNORE INTO items (code, file_id, unique_id, kind) "
@@ -40,6 +48,58 @@ except sqlite3.OperationalError:
     pass
 db.commit()
 
+known_groups = {r[0] for r in db.execute("SELECT chat_id FROM known_groups")}
+admin_cache = {}
+
+
+# ---------- admin check ----------
+
+async def is_admin_in(bot, chat_id, user_id):
+    key = (chat_id, user_id)
+    hit = admin_cache.get(key)
+    if hit and time.time() - hit[0] < 60:
+        return hit[1]
+    try:
+        member = await bot.get_chat_member(chat_id, user_id)
+        ok = member.status in ("administrator", "creator")
+    except Exception:
+        ok = False
+    admin_cache[key] = (time.time(), ok)
+    return ok
+
+
+async def is_admin(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat = update.effective_chat
+    user = update.effective_user
+    msg = update.effective_message
+    if not chat:
+        return False
+    if user and user.id in ADMIN_IDS:
+        return True
+
+    if chat.type in ("group", "supergroup"):
+        # admin posting anonymously
+        if msg and msg.sender_chat and msg.sender_chat.id == chat.id:
+            return True
+        return bool(user) and await is_admin_in(context.bot, chat.id, user.id)
+
+    if chat.type == "private" and user:
+        # admin of any group the bot knows
+        for cid in list(known_groups):
+            if await is_admin_in(context.bot, cid, user.id):
+                return True
+    return False
+
+
+async def remember_group(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat = update.effective_chat
+    if chat and chat.type in ("group", "supergroup") and chat.id not in known_groups:
+        known_groups.add(chat.id)
+        db.execute("INSERT OR IGNORE INTO known_groups (chat_id) VALUES (?)", (chat.id,))
+        db.commit()
+
+
+# ---------- helpers ----------
 
 def get_code(text):
     words = (text or "").split()
@@ -79,6 +139,8 @@ def finish_batch(context):
     return f"Done. Added {added} new item(s) to {code}. Total: {total_for(code)}"
 
 
+# ---------- handlers ----------
+
 async def save_media(update: Update, context: ContextTypes.DEFAULT_TYPE):
     msg = update.effective_message
     if not msg:
@@ -86,13 +148,15 @@ async def save_media(update: Update, context: ContextTypes.DEFAULT_TYPE):
     f, kind = get_file(msg)
     if not f:
         return
+    if not await is_admin(update, context):
+        return  # only admins can add
 
-    # Batch mode: everything goes to the batch code
+    # Batch mode
     batch_code = context.chat_data.get("batch")
     if batch_code:
         idle = time.time() - context.chat_data.get("batch_time", 0)
         if idle > BATCH_IDLE_SECONDS:
-            finish_batch(context)  # expired, continue as normal
+            finish_batch(context)
         else:
             added = add_item(batch_code, f, kind)
             context.chat_data["batch_count"] = (
@@ -104,7 +168,7 @@ async def save_media(update: Update, context: ContextTypes.DEFAULT_TYPE):
     code = get_code(msg.caption)
     gid = msg.media_group_id
 
-    # Album: the caption on one item gives the code to all items
+    # Album: one caption gives the code to all items
     if gid:
         if code:
             db.execute(
@@ -153,6 +217,9 @@ async def save_media(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def batch_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     msg = update.effective_message
+    if not await is_admin(update, context):
+        await msg.reply_text("Only admins can do this.")
+        return
     if not context.args:
         await msg.reply_text("Use: /batch CODE")
         return
@@ -172,19 +239,28 @@ async def batch_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def done_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    text = finish_batch(context) or "No batch is running."
-    await update.effective_message.reply_text(text)
+    msg = update.effective_message
+    if not await is_admin(update, context):
+        await msg.reply_text("Only admins can do this.")
+        return
+    await msg.reply_text(finish_batch(context) or "No batch is running.")
 
 
 async def done_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
+    if not await is_admin(update, context):
+        await query.answer("Only admins can do this.", show_alert=True)
+        return
     await query.answer()
-    text = finish_batch(context) or "No batch is running."
-    await query.edit_message_text(text)
+    await query.edit_message_text(finish_batch(context) or "No batch is running.")
 
 
 async def remove_item(update: Update, context: ContextTypes.DEFAULT_TYPE):
     msg = update.effective_message
+    if not await is_admin(update, context):
+        await msg.reply_text("Only admins can do this.")
+        return
+
     target = msg.reply_to_message
 
     # Reply to a video/photo with /remove
@@ -210,10 +286,7 @@ async def remove_item(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 (f.file_unique_id, f.file_id),
             )
         db.commit()
-        if cur.rowcount:
-            await msg.reply_text("Removed.")
-        else:
-            await msg.reply_text("Not found in saved items.")
+        await msg.reply_text("Removed." if cur.rowcount else "Not found in saved items.")
         return
 
     # /remove CODE
@@ -253,6 +326,7 @@ def main():
         raise SystemExit("Missing TELEGRAM_BOT_TOKEN")
 
     app = Application.builder().token(TOKEN).build()
+    app.add_handler(MessageHandler(filters.ChatType.GROUPS, remember_group), group=-1)
     app.add_handler(CommandHandler("remove", remove_item))
     app.add_handler(CommandHandler("batch", batch_cmd))
     app.add_handler(CommandHandler("done", done_cmd))
