@@ -14,7 +14,6 @@ db.commit()
 
 
 async def save_media(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Saves a photo/video using its caption as the code."""
     msg = update.effective_message
     if not msg or not msg.caption:
         return
@@ -37,7 +36,6 @@ async def save_media(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def send_media(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """In private chat: you send a code, the bot sends the media."""
     code = update.message.text.strip().lower()
     row = db.execute(
         "SELECT file_id, kind FROM media WHERE code = ?", (code,)
@@ -69,5 +67,4 @@ def main():
     app.run_polling()
 
 
-if _name_ == "_main_":
-    main()
+main()
