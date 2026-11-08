@@ -1,4 +1,5 @@
 import os
+import asyncio
 import sqlite3
 from telegram import Update
 from telegram.ext import Application, MessageHandler, ContextTypes, filters
@@ -8,8 +9,18 @@ TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
 DB_PATH = "/data/media.db" if os.path.isdir("/data") else "media.db"
 db = sqlite3.connect(DB_PATH, check_same_thread=False)
 db.execute(
-    "CREATE TABLE IF NOT EXISTS media (code TEXT PRIMARY KEY, file_id TEXT, kind TEXT)"
+    "CREATE TABLE IF NOT EXISTS items ("
+    "id INTEGER PRIMARY KEY AUTOINCREMENT, "
+    "code TEXT, file_id TEXT, unique_id TEXT, kind TEXT, "
+    "UNIQUE(code, unique_id))"
 )
+try:
+    db.execute(
+        "INSERT OR IGNORE INTO items (code, file_id, unique_id, kind) "
+        "SELECT code, file_id, file_id, kind FROM media"
+    )
+except sqlite3.OperationalError:
+    pass
 db.commit()
 
 
@@ -21,35 +32,45 @@ async def save_media(update: Update, context: ContextTypes.DEFAULT_TYPE):
     code = msg.caption.strip().split()[0].lower()
 
     if msg.photo:
-        file_id, kind = msg.photo[-1].file_id, "photo"
+        f, kind = msg.photo[-1], "photo"
     elif msg.video:
-        file_id, kind = msg.video.file_id, "video"
+        f, kind = msg.video, "video"
     else:
         return
 
-    db.execute(
-        "INSERT OR REPLACE INTO media (code, file_id, kind) VALUES (?, ?, ?)",
-        (code, file_id, kind),
+    cur = db.execute(
+        "INSERT OR IGNORE INTO items (code, file_id, unique_id, kind) "
+        "VALUES (?, ?, ?, ?)",
+        (code, f.file_id, f.file_unique_id, kind),
     )
     db.commit()
-    await msg.reply_text(f"Saved with code: {code}")
+
+    total = db.execute(
+        "SELECT COUNT(*) FROM items WHERE code = ?", (code,)
+    ).fetchone()[0]
+
+    if cur.rowcount:
+        await msg.reply_text(f"Saved with code: {code} ({total} items)")
+    else:
+        await msg.reply_text(f"Already saved under: {code} ({total} items)")
 
 
 async def send_media(update: Update, context: ContextTypes.DEFAULT_TYPE):
     code = update.message.text.strip().lower()
-    row = db.execute(
-        "SELECT file_id, kind FROM media WHERE code = ?", (code,)
-    ).fetchone()
+    rows = db.execute(
+        "SELECT file_id, kind FROM items WHERE code = ? ORDER BY id", (code,)
+    ).fetchall()
 
-    if not row:
+    if not rows:
         await update.message.reply_text("No media found for that code.")
         return
 
-    file_id, kind = row
-    if kind == "photo":
-        await update.message.reply_photo(file_id)
-    else:
-        await update.message.reply_video(file_id)
+    for file_id, kind in rows:
+        if kind == "photo":
+            await update.message.reply_photo(file_id)
+        else:
+            await update.message.reply_video(file_id)
+        await asyncio.sleep(0.4)
 
 
 def main():
